@@ -1,0 +1,306 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        default: "main"
+
+env:
+  SDL_VERSION: "3.4.20"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [full, demo]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SRC_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Fetch SDL3 (VC dev package, same version as the local build)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $u = "https://github.com/libsdl-org/SDL/releases/download/release-$env:SDL_VERSION/SDL3-devel-$env:SDL_VERSION-VC.zip"
+          # github.com's release host sometimes 504s for minutes: alternate it with the API route (gh), back off, then give up
+          $ok = $false
+          for ($i = 1; $i -le 8 -and -not $ok; $i++) {
+            try {
+              if ($i % 2 -eq 1) { Invoke-WebRequest $u -OutFile sdl.zip -TimeoutSec 120 }
+              else { gh release download "release-$env:SDL_VERSION" -R libsdl-org/SDL -p "SDL3-devel-$env:SDL_VERSION-VC.zip" -O sdl.zip --clobber; if ($LASTEXITCODE -ne 0) { throw "gh failed" } }
+              $ok = (Test-Path sdl.zip) -and ((Get-Item sdl.zip).Length -gt 1000000)
+            } catch { Write-Host "attempt $i failed: $_" }
+            if (-not $ok) { Start-Sleep -Seconds ([Math]::Min(60, 10 * $i)) }
+          }
+          if (-not $ok) { throw "could not download SDL3" }
+          Expand-Archive sdl.zip -DestinationPath "$env:RUNNER_TEMP\sdl"
+          "SDL3_DIR=$env:RUNNER_TEMP\sdl\SDL3-$env:SDL_VERSION\cmake" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -A x64 "-DSDL3_DIR=$env:SDL3_DIR" -DNHS_DEV=OFF -DNHS_DEMO=${{ matrix.variant == 'demo' && 'ON' || 'OFF' }} "-DNHS_LICENSE_URL=${{ vars.NHS_LICENSE_URL }}" "-DNHS_LICENSE_PUBKEY=${{ vars.NHS_LICENSE_PUBKEY }}" "-DNHS_ITCH_URL=${{ vars.NHS_ITCH_URL }}"
+
+      - name: Build (Release)
+        run: cmake --build build --config Release
+
+      - name: Selftests
+        shell: pwsh
+        run: |
+          Push-Location build\Release
+          $out = & .\untitled.exe --selftest 2>&1 | Out-String
+          Write-Output $out
+          if ($out -cnotmatch "selftest: 0 failure" -or $out -cmatch "(?m)^\s*FAIL ") { throw "selftests failed" }
+          $global:LASTEXITCODE = 0
+          Pop-Location
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = if ("${{ matrix.variant }}" -eq "demo") { "NoHopeSt-Demo-Windows" } else { "NoHopeSt-Windows" }
+          New-Item -ItemType Directory -Force "out\$name" | Out-Null
+          Copy-Item build\Release\untitled.exe "out\$name\NoHopeSt.exe"
+          Copy-Item build\Release\SDL3.dll "out\$name\"
+          Compress-Archive -Path "out\$name\*" -DestinationPath "out\$name.zip"
+
+      - name: Deliver
+        shell: bash
+        env:
+          KEY: ${{ secrets.DEPLOY_KEY }}
+          SRC: ${{ secrets.SRC_REPO }}
+        run: |
+          set -e
+          mkdir -p ~/.ssh && echo "$KEY" > ~/.ssh/k && chmod 600 ~/.ssh/k
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/k -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes"
+          shopt -s nullglob; files=(out/*.zip out/*.tar.gz out/*.ipa); f="${files[0]}"; test -n "$f"
+          b=$(basename "$f"); b=${b%.tar.gz}; b=${b%.zip}; b=${b%.ipa}
+          d=$(mktemp -d) && cp "$f" "$d/" && cd "$d"
+          git init -q -b x && git add -A && git -c user.name=build -c user.email=build@localhost commit -q -m "$b"
+          git push -q -f "git@github.com:$SRC.git" "HEAD:refs/heads/bin/$b"
+          rm -f ~/.ssh/k
+
+  macos:
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [full, demo]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SRC_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Fetch SDL3 source
+        run: for i in 1 2 3 4 5; do rm -rf "$RUNNER_TEMP/SDL3"; git clone --depth 1 --branch release-$SDL_VERSION https://github.com/libsdl-org/SDL.git "$RUNNER_TEMP/SDL3" && break; [ $i = 5 ] && exit 1; sleep $((10 * i)); done
+
+      - name: Configure (universal arm64 + x86_64)
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+          -DSDL3_SOURCE_DIR="$RUNNER_TEMP/SDL3" -DNHS_DEV=OFF -DNHS_DEMO=${{ matrix.variant == 'demo' && 'ON' || 'OFF' }} "-DNHS_LICENSE_URL=${{ vars.NHS_LICENSE_URL }}" "-DNHS_LICENSE_PUBKEY=${{ vars.NHS_LICENSE_PUBKEY }}" "-DNHS_ITCH_URL=${{ vars.NHS_ITCH_URL }}"
+
+      - name: Build
+        run: cmake --build build --config Release -j 4
+
+      - name: Selftests
+        run: |
+          out=$(./build/NoHopeSt.app/Contents/MacOS/NoHopeSt --selftest 2>&1) || true; echo "$out"
+          echo "$out" | grep -q "selftest: 0 failure" && ! echo "$out" | grep -qE "^ *FAIL "
+
+      - name: Package
+        run: |
+          set -e
+          test -f build/NoHopeSt.app/Contents/Resources/AppIcon.icns   # mac/AppIcon.icns, copied in by CMake
+          strip -x build/NoHopeSt.app/Contents/MacOS/NoHopeSt   # no symbols in what players get
+          codesign --force --deep --sign - build/NoHopeSt.app   # ad-hoc: runs after "Open" on first launch
+          name=${{ matrix.variant == 'demo' && 'NoHopeSt-Demo-macOS' || 'NoHopeSt-macOS' }}
+          mkdir -p out
+          if [ "${{ matrix.variant }}" = "demo" ]; then mv "build/NoHopeSt.app" "build/No Hope St Demo.app"; app="No Hope St Demo.app"; else mv "build/NoHopeSt.app" "build/No Hope St.app"; app="No Hope St.app"; fi
+          (cd build && ditto -c -k --sequesterRsrc --keepParent "$app" "../out/$name.zip")
+
+      - name: Deliver
+        shell: bash
+        env:
+          KEY: ${{ secrets.DEPLOY_KEY }}
+          SRC: ${{ secrets.SRC_REPO }}
+        run: |
+          set -e
+          mkdir -p ~/.ssh && echo "$KEY" > ~/.ssh/k && chmod 600 ~/.ssh/k
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/k -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes"
+          shopt -s nullglob; files=(out/*.zip out/*.tar.gz out/*.ipa); f="${files[0]}"; test -n "$f"
+          b=$(basename "$f"); b=${b%.tar.gz}; b=${b%.zip}; b=${b%.ipa}
+          d=$(mktemp -d) && cp "$f" "$d/" && cd "$d"
+          git init -q -b x && git add -A && git -c user.name=build -c user.email=build@localhost commit -q -m "$b"
+          git push -q -f "git@github.com:$SRC.git" "HEAD:refs/heads/bin/$b"
+          rm -f ~/.ssh/k
+
+  linux:
+    runs-on: ubuntu-22.04   # older glibc: the binary runs on more distros
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [full, demo]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SRC_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Install SDL3 build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
+            libxfixes-dev libxi-dev libxss-dev libxtst-dev libxkbcommon-dev libdrm-dev libgbm-dev libgl1-mesa-dev \
+            libgles2-mesa-dev libegl1-mesa-dev libdbus-1-dev libibus-1.0-dev libudev-dev libwayland-dev \
+            wayland-protocols libdecor-0-dev
+
+      - name: Fetch SDL3 source
+        run: for i in 1 2 3 4 5; do rm -rf "$RUNNER_TEMP/SDL3"; git clone --depth 1 --branch release-$SDL_VERSION https://github.com/libsdl-org/SDL.git "$RUNNER_TEMP/SDL3" && break; [ $i = 5 ] && exit 1; sleep $((10 * i)); done
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DSDL3_SOURCE_DIR="$RUNNER_TEMP/SDL3" -DNHS_DEV=OFF -DNHS_DEMO=${{ matrix.variant == 'demo' && 'ON' || 'OFF' }} "-DNHS_LICENSE_URL=${{ vars.NHS_LICENSE_URL }}" "-DNHS_LICENSE_PUBKEY=${{ vars.NHS_LICENSE_PUBKEY }}" "-DNHS_ITCH_URL=${{ vars.NHS_ITCH_URL }}"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Selftests
+        run: |
+          out=$(./build/untitled --selftest 2>&1) || true; echo "$out"
+          echo "$out" | grep -q "selftest: 0 failure" && ! echo "$out" | grep -qE "^ *FAIL "
+
+      - name: Package
+        run: |
+          name=${{ matrix.variant == 'demo' && 'NoHopeSt-Demo-Linux' || 'NoHopeSt-Linux' }}
+          mkdir -p "out/$name"
+          cp build/untitled "out/$name/NoHopeSt"
+          chmod +x "out/$name/NoHopeSt"
+          strip "out/$name/NoHopeSt"
+          tar -C out -czf "out/$name.tar.gz" "$name"
+
+      - name: Deliver
+        shell: bash
+        env:
+          KEY: ${{ secrets.DEPLOY_KEY }}
+          SRC: ${{ secrets.SRC_REPO }}
+        run: |
+          set -e
+          mkdir -p ~/.ssh && echo "$KEY" > ~/.ssh/k && chmod 600 ~/.ssh/k
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/k -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes"
+          shopt -s nullglob; files=(out/*.zip out/*.tar.gz out/*.ipa); f="${files[0]}"; test -n "$f"
+          b=$(basename "$f"); b=${b%.tar.gz}; b=${b%.zip}; b=${b%.ipa}
+          d=$(mktemp -d) && cp "$f" "$d/" && cd "$d"
+          git init -q -b x && git add -A && git -c user.name=build -c user.email=build@localhost commit -q -m "$b"
+          git push -q -f "git@github.com:$SRC.git" "HEAD:refs/heads/bin/$b"
+          rm -f ~/.ssh/k
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SRC_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Set up emscripten (git clone + install, retried - the archive host 504s some days)
+        run: |
+          for i in 1 2 3 4 5; do rm -rf "$RUNNER_TEMP/emsdk"; git clone --depth 1 https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/emsdk" && break; [ $i = 5 ] && exit 1; sleep $((15 * i)); done
+          cd "$RUNNER_TEMP/emsdk"
+          for i in 1 2 3 4; do ./emsdk install latest && break; [ $i = 4 ] && exit 1; sleep $((20 * i)); done
+          ./emsdk activate latest
+          source ./emsdk_env.sh
+          echo "EMSDK=$EMSDK" >> "$GITHUB_ENV"
+          echo "$EMSDK" >> "$GITHUB_PATH"
+          echo "$EMSDK/upstream/emscripten" >> "$GITHUB_PATH"
+          emcc --version | head -1
+
+      - name: Fetch SDL3 source
+        run: for i in 1 2 3 4 5; do rm -rf "$RUNNER_TEMP/SDL3"; git clone --depth 1 --branch release-$SDL_VERSION https://github.com/libsdl-org/SDL.git "$RUNNER_TEMP/SDL3" && break; [ $i = 5 ] && exit 1; sleep $((10 * i)); done
+
+      - name: Build (browser demo)
+        run: |
+          emcmake cmake -S . -B build-web -DCMAKE_BUILD_TYPE=Release -DSDL3_SOURCE_DIR="$RUNNER_TEMP/SDL3" -DNHS_DEV=OFF -DNHS_DEMO=ON
+          cmake --build build-web -j 4
+
+      - name: Package
+        run: |
+          mkdir -p out
+          (cd build-web && zip -9 ../out/NoHopeSt-Demo-Web.zip index.html index.js index.wasm)
+
+      - name: Deliver
+        shell: bash
+        env:
+          KEY: ${{ secrets.DEPLOY_KEY }}
+          SRC: ${{ secrets.SRC_REPO }}
+        run: |
+          set -e
+          mkdir -p ~/.ssh && echo "$KEY" > ~/.ssh/k && chmod 600 ~/.ssh/k
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/k -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes"
+          shopt -s nullglob; files=(out/*.zip out/*.tar.gz out/*.ipa); f="${files[0]}"; test -n "$f"
+          b=$(basename "$f"); b=${b%.tar.gz}; b=${b%.zip}; b=${b%.ipa}
+          d=$(mktemp -d) && cp "$f" "$d/" && cd "$d"
+          git init -q -b x && git add -A && git -c user.name=build -c user.email=build@localhost commit -q -m "$b"
+          git push -q -f "git@github.com:$SRC.git" "HEAD:refs/heads/bin/$b"
+          rm -f ~/.ssh/k
+
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SRC_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Fetch SDL3 source
+        run: for i in 1 2 3 4 5; do rm -rf "$RUNNER_TEMP/SDL3"; git clone --depth 1 --branch release-$SDL_VERSION https://github.com/libsdl-org/SDL.git "$RUNNER_TEMP/SDL3" && break; [ $i = 5 ] && exit 1; sleep $((10 * i)); done
+
+      - name: Configure (Xcode, iOS arm64)
+        run: >
+          cmake -S . -B build-ios -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DSDL3_SOURCE_DIR="$RUNNER_TEMP/SDL3" -DNHS_DEV=OFF
+
+      - name: Build (Release, unsigned)
+        run: >
+          cmake --build build-ios --config Release --target untitled --
+          -sdk iphoneos CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      - name: Package
+        run: |
+          APP=$(find build-ios -type d -name "NoHopeSt.app" -path "*Release-iphoneos*" | head -1)
+          test -n "$APP"
+          mkdir -p out/Payload && cp -R "$APP" out/Payload/
+          (cd out && zip -qry NoHopeSt-iOS.ipa Payload && rm -rf Payload)
+
+      - name: Deliver
+        shell: bash
+        env:
+          KEY: ${{ secrets.DEPLOY_KEY }}
+          SRC: ${{ secrets.SRC_REPO }}
+        run: |
+          set -e
+          mkdir -p ~/.ssh && echo "$KEY" > ~/.ssh/k && chmod 600 ~/.ssh/k
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/k -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes"
+          shopt -s nullglob; files=(out/*.zip out/*.tar.gz out/*.ipa); f="${files[0]}"; test -n "$f"
+          b=$(basename "$f"); b=${b%.tar.gz}; b=${b%.zip}; b=${b%.ipa}
+          d=$(mktemp -d) && cp "$f" "$d/" && cd "$d"
+          git init -q -b x && git add -A && git -c user.name=build -c user.email=build@localhost commit -q -m "$b"
+          git push -q -f "git@github.com:$SRC.git" "HEAD:refs/heads/bin/$b"
+          rm -f ~/.ssh/k
